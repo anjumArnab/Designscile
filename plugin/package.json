@@ -1,0 +1,14 @@
+{
+  "name": "designsicle-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Figma plugin sandbox + iframe for Designsicle",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.109.0",
+    "typescript": "^5.7.2"
+  }
+}

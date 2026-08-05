@@ -1,0 +1,13 @@
+{
+  "name": "designsicle-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server + WebSocket relay bridging the Designsicle Figma plugin to a coding agent",
+  "main": "index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "ws": "^8.18.0",
+    "zod": "^4.4.3"
+  }
+}

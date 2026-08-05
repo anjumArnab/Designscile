@@ -1,0 +1,697 @@
+<!-- Designsicle — plugin iframe.
+     Owns the panel UI and all socket I/O. Has NO node access; everything about
+     the design arrives from code.ts over postMessage. Single file, vanilla JS,
+     no build step. -->
+<style>
+  :root {
+    --bg: var(--figma-color-bg, #ffffff);
+    --bg-secondary: var(--figma-color-bg-secondary, #f5f5f5);
+    --bg-hover: var(--figma-color-bg-hover, #ebebeb);
+    --brand: var(--figma-color-bg-brand, #0d99ff);
+    --text: var(--figma-color-text, #1e1e1e);
+    --text-secondary: var(--figma-color-text-secondary, #767676);
+    --text-onbrand: var(--figma-color-text-onbrand, #ffffff);
+    --border: var(--figma-color-border, #e6e6e6);
+    --border-strong: var(--figma-color-border-strong, #c4c4c4);
+    --success: var(--figma-color-text-success, #009951);
+    --danger: var(--figma-color-text-danger, #d93025);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    padding: 12px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, -apple-system, "Segoe UI", sans-serif;
+    font-size: 11px;
+    line-height: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: 100vh;
+  }
+
+  .section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .label {
+    font-weight: 600;
+    letter-spacing: 0.005em;
+  }
+
+  .meta {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: none;
+  }
+
+  .icon-button {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+  }
+
+  .icon-button:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  .icon-button:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
+  .icon-button.done {
+    color: var(--success);
+  }
+
+  /* The preview is a FIXED frame and the render scales to fit inside it.
+     Sizing it to the component made the panel jump on every selection change:
+     an <img> with max-height:100% inside a flex-basis-sized parent is a
+     circular dependency, so the browser falls back to intrinsic size. */
+  .canvas-section {
+    flex: none;
+  }
+
+  .canvas {
+    flex: none;
+    width: 100%;
+    height: 260px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background-color: var(--bg-secondary);
+    background-image:
+      linear-gradient(45deg, rgba(128, 128, 128, 0.09) 25%, transparent 25%),
+      linear-gradient(-45deg, rgba(128, 128, 128, 0.09) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, rgba(128, 128, 128, 0.09) 75%),
+      linear-gradient(-45deg, transparent 75%, rgba(128, 128, 128, 0.09) 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 8px;
+  }
+
+  .canvas img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+
+  .canvas .placeholder {
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 0 16px;
+  }
+
+  /* The spec takes whatever is left, and min-height:0 lets it actually shrink
+     — without it a flex item refuses to go below its content height. */
+  .spec-section {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  textarea {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    resize: none;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text);
+    /* Monospace is load-bearing: the spec's two-space indentation is what
+       carries the tree structure, so the glyphs have to align. */
+    font-family: ui-monospace, "Cascadia Mono", "SF Mono", "JetBrains Mono", Menlo, Consolas,
+      "Liberation Mono", monospace;
+    font-size: 11px;
+    line-height: 17px;
+    font-variant-ligatures: none;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow-y: auto;
+  }
+
+  textarea:focus {
+    outline: 1px solid var(--brand);
+    outline-offset: -2px;
+  }
+
+  textarea.error {
+    color: var(--danger);
+  }
+
+  .status {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+    flex: none;
+  }
+
+  .status .spacer {
+    flex: 1;
+  }
+
+  /* Anchored above the status line and absolutely positioned, so appearing and
+     disappearing never reflows the spec box underneath it. */
+  .tip {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 9px);
+    left: 0;
+    right: 0;
+    z-index: 10;
+    padding: 10px 12px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  }
+
+  .status.show-tip .tip,
+  .status:hover .tip {
+    display: block;
+  }
+
+  /* Two stacked triangles fake a bordered arrow: the outer one is the border
+     colour, the inner one sits 1px higher in the fill colour. */
+  .tip::before,
+  .tip::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 12px;
+    border: 6px solid transparent;
+  }
+
+  .tip::before {
+    border-top-color: var(--border-strong);
+  }
+
+  .tip::after {
+    margin-top: -1px;
+    border-top-color: var(--bg);
+  }
+
+  .tip-title {
+    font-weight: 600;
+    margin-bottom: 4px;
+    padding-right: 16px;
+  }
+
+  .tip p {
+    margin: 0 0 6px;
+    color: var(--text-secondary);
+  }
+
+  .tip ol {
+    margin: 0 0 6px;
+    padding-left: 16px;
+    color: var(--text-secondary);
+  }
+
+  .tip li {
+    margin-bottom: 2px;
+  }
+
+  .tip code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 10px;
+    background: var(--bg-secondary);
+    border-radius: 3px;
+    padding: 1px 4px;
+  }
+
+  .tip-foot {
+    margin-bottom: 0 !important;
+  }
+
+  .tip-close {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+
+  .tip-close:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  .status[data-state="connected"] .status-text {
+    color: var(--success);
+  }
+
+  .status[data-state="disconnected"] .status-text {
+    color: var(--danger);
+  }
+</style>
+
+<div class="section canvas-section">
+  <div class="section-header">
+    <span class="label">Component</span>
+    <span class="meta" id="component-name"></span>
+    <span class="actions">
+      <button
+        type="button"
+        class="icon-button"
+        id="download-button"
+        title="Download JPEG"
+        aria-label="Download JPEG"
+        disabled
+      >
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M8 2v8m0 0L5 7m3 3 3-3M3 12v1a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    </span>
+  </div>
+  <div class="canvas" id="canvas">
+    <span class="placeholder" id="canvas-placeholder">Select a component in Figma</span>
+  </div>
+</div>
+
+<div class="section spec-section">
+  <div class="section-header">
+    <span class="label">Spec</span>
+    <span class="meta" id="spec-meta"></span>
+    <span class="actions">
+      <button
+        type="button"
+        class="icon-button"
+        id="copy-button"
+        title="Copy spec"
+        aria-label="Copy spec"
+        disabled
+      >
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect
+            x="5.75"
+            y="5.75"
+            width="8.5"
+            height="8.5"
+            rx="1.5"
+            stroke="currentColor"
+            stroke-width="1.4"
+          />
+          <path
+            d="M10.25 3.75A1.5 1.5 0 0 0 8.75 2.25h-5a1.5 1.5 0 0 0-1.5 1.5v5a1.5 1.5 0 0 0 1.5 1.5"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          />
+        </svg>
+      </button>
+    </span>
+  </div>
+  <textarea id="spec" readonly spellcheck="false"></textarea>
+</div>
+
+<div class="status" id="status" data-state="connecting">
+  <span class="status-text" id="status-text">Connecting…</span>
+  <span class="spacer"></span>
+  <button
+    type="button"
+    class="icon-button"
+    id="help-button"
+    title="How do I connect?"
+    aria-label="How do I connect?"
+  >
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.3" stroke="currentColor" stroke-width="1.3" />
+      <path
+        d="M6.4 6.2a1.65 1.65 0 1 1 1.9 1.62v1"
+        stroke="currentColor"
+        stroke-width="1.3"
+        stroke-linecap="round"
+      />
+      <circle cx="8.3" cy="11.1" r="0.75" fill="currentColor" />
+    </svg>
+  </button>
+
+  <div class="tip" id="tip" role="note">
+    <button type="button" class="tip-close" id="tip-close" aria-label="Dismiss">×</button>
+    <div class="tip-title">Waiting for the Designsicle server</div>
+    <p>You don't start the server yourself — your coding agent launches it.</p>
+    <ol>
+      <li>Add <code>designsicle</code> to the project's <code>.mcp.json</code></li>
+      <li>Open your coding agent in that project</li>
+    </ol>
+    <p class="tip-foot">
+      Retrying <code>ws://localhost:3055</code> every 2s — this panel reconnects on its own, so
+      there's no need to reopen it.
+    </p>
+  </div>
+</div>
+
+<script>
+  "use strict";
+
+  // Everything lives inside an IIFE. A top-level `var` in a classic script
+  // becomes a property of `window`, and several built-ins there (status, name,
+  // top, origin…) coerce whatever you assign into a string. `var status = <div>`
+  // silently became "[object HTMLDivElement]" and every later use threw.
+  (function () {
+    var canvas = document.getElementById("canvas");
+    var canvasPlaceholder = document.getElementById("canvas-placeholder");
+    var specBox = document.getElementById("spec");
+    var specMeta = document.getElementById("spec-meta");
+    var componentName = document.getElementById("component-name");
+    var copyButton = document.getElementById("copy-button");
+    var downloadButton = document.getElementById("download-button");
+    var statusEl = document.getElementById("status");
+    var statusText = document.getElementById("status-text");
+    var helpButton = document.getElementById("help-button");
+    var tipClose = document.getElementById("tip-close");
+
+    var SERVER_URL = "ws://localhost:3055";
+    var RECONNECT_DELAY_MS = 2000;
+    var FEEDBACK_MS = 1200;
+
+    var state = {
+      spec: null,
+      componentName: null,
+      imageUrl: null,
+      imageBase64: null
+    };
+
+    var socket = null;
+
+    // Helpers
+
+    // Once dismissed the hint stays down for this disconnection, but a fresh
+    // drop after a successful connection earns it back — a plugin that nags
+    // through a whole session is worse than one that says nothing.
+    var tipDismissed = false;
+
+    function setStatus(stateName, text) {
+      statusEl.setAttribute("data-state", stateName);
+      statusText.textContent = text;
+
+      if (stateName === "connected") {
+        tipDismissed = false;
+        statusEl.classList.remove("show-tip");
+        return;
+      }
+      // "connecting" is the very first attempt; nothing has failed yet.
+      if (stateName === "disconnected" && !tipDismissed) {
+        statusEl.classList.add("show-tip");
+      }
+    }
+
+    helpButton.addEventListener("click", function () {
+      tipDismissed = false;
+      statusEl.classList.toggle("show-tip");
+    });
+
+    tipClose.addEventListener("click", function (event) {
+      event.stopPropagation();
+      tipDismissed = true;
+      statusEl.classList.remove("show-tip");
+    });
+
+    function isOpen() {
+      return socket !== null && socket.readyState === WebSocket.OPEN;
+    }
+
+    function send(payload) {
+      if (isOpen()) {
+        socket.send(JSON.stringify(payload));
+      }
+    }
+
+    // Chunked so a large render does not blow the argument limit on apply().
+    function toBase64(bytes) {
+      var chunkSize = 0x8000;
+      var pieces = [];
+      for (var i = 0; i < bytes.length; i += chunkSize) {
+        pieces.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
+      }
+      return btoa(pieces.join(""));
+    }
+
+    function safeFileName(name) {
+      var cleaned = (name || "component").replace(/[^a-z0-9\-_ ]/gi, "").trim();
+      return (cleaned === "" ? "component" : cleaned).replace(/\s+/g, "-").toLowerCase();
+    }
+
+    function flash(button) {
+      button.classList.add("done");
+      setTimeout(function () {
+        button.classList.remove("done");
+      }, FEEDBACK_MS);
+    }
+
+    // Rendering
+
+    function renderSpec(payload) {
+      state.spec = payload.ok ? payload.spec : null;
+      state.componentName = payload.componentName || null;
+      componentName.textContent = state.componentName || "";
+
+      if (payload.ok) {
+        specBox.classList.remove("error");
+        specBox.value = payload.spec;
+        var lines = payload.spec.split("\n").length;
+        specMeta.textContent = lines + (lines === 1 ? " line" : " lines");
+      } else {
+        specBox.classList.add("error");
+        specBox.value = payload.error || "Nothing selected in Figma.";
+        specMeta.textContent = "";
+      }
+      copyButton.disabled = state.spec === null;
+    }
+
+    function renderImage(payload) {
+      if (state.imageUrl !== null) {
+        URL.revokeObjectURL(state.imageUrl);
+        state.imageUrl = null;
+      }
+      state.imageBase64 = null;
+
+      var existing = canvas.querySelector("img");
+      if (existing !== null) {
+        canvas.removeChild(existing);
+      }
+
+      if (!payload.ok || !payload.bytes) {
+        canvasPlaceholder.textContent = payload.error || "Select a component in Figma";
+        canvasPlaceholder.style.display = "";
+        downloadButton.disabled = true;
+        return;
+      }
+
+      var bytes = new Uint8Array(payload.bytes);
+      state.imageBase64 = toBase64(bytes);
+      var blob = new Blob([bytes], { type: "image/jpeg" });
+      state.imageUrl = URL.createObjectURL(blob);
+
+      var img = document.createElement("img");
+      img.src = state.imageUrl;
+      img.alt = state.componentName || "Component preview";
+      canvas.appendChild(img);
+
+      canvasPlaceholder.style.display = "none";
+      downloadButton.disabled = false;
+    }
+
+    // Actions
+
+    copyButton.addEventListener("click", function () {
+      if (state.spec === null) {
+        return;
+      }
+      // The async clipboard API is unreliable inside Figma's iframe, so select
+      // the textarea and use the legacy path, which is permitted here.
+      specBox.removeAttribute("readonly");
+      specBox.select();
+      specBox.setSelectionRange(0, specBox.value.length);
+      try {
+        document.execCommand("copy");
+        flash(copyButton);
+      } catch (error) {
+        /* nothing useful to do — the text is selected for a manual copy */
+      }
+      specBox.setAttribute("readonly", "readonly");
+      window.getSelection().removeAllRanges();
+    });
+
+    downloadButton.addEventListener("click", function () {
+      if (state.imageUrl === null) {
+        return;
+      }
+      var link = document.createElement("a");
+      link.href = state.imageUrl;
+      link.download = safeFileName(state.componentName) + ".jpg";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      flash(downloadButton);
+    });
+
+    // Socket
+
+    // The MCP client launches the server and may restart it independently, so
+    // the plugin has to recover on its own — a user should never have to reopen
+    // it.
+    function connect() {
+      try {
+        socket = new WebSocket(SERVER_URL);
+      } catch (error) {
+        scheduleReconnect();
+        return;
+      }
+
+      socket.onopen = function () {
+        setStatus("connected", "Connected");
+        send({ type: "hello", source: "designsicle-plugin" });
+      };
+
+      socket.onclose = function () {
+        setStatus("disconnected", "Disconnected and retrying");
+        scheduleReconnect();
+      };
+
+      socket.onerror = function () {
+        // onclose always follows, which is where the retry is scheduled.
+      };
+
+      socket.onmessage = function (event) {
+        var message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (error) {
+          return;
+        }
+        handleServerMessage(message);
+      };
+    }
+
+    function scheduleReconnect() {
+      socket = null;
+      setTimeout(connect, RECONNECT_DELAY_MS);
+    }
+
+    function handleServerMessage(message) {
+      if (!message || typeof message !== "object") {
+        return;
+      }
+      // The iframe has no node access, so both extraction and rendering happen
+      // in the sandbox. The server's id rides along as requestId and comes back
+      // untouched, which is what keeps overlapping calls from crossing wires.
+      if (message.type === "get_spec") {
+        parent.postMessage({ pluginMessage: { type: "extract", requestId: message.id } }, "*");
+        return;
+      }
+      if (message.type === "get_image") {
+        parent.postMessage({ pluginMessage: { type: "export_image", requestId: message.id } }, "*");
+      }
+    }
+
+    // Sandbox messages
+
+    window.onmessage = function (event) {
+      var message = event.data && event.data.pluginMessage;
+      if (!message || typeof message !== "object") {
+        return;
+      }
+
+      if (message.type === "preview") {
+        renderSpec(message);
+        return;
+      }
+
+      if (message.type === "preview_image") {
+        renderImage(message);
+        return;
+      }
+
+      if (message.type === "spec_result") {
+        renderSpec(message);
+        if (message.requestId === undefined || message.requestId === null) {
+          return;
+        }
+        send({
+          type: "spec_result",
+          id: message.requestId,
+          ok: message.ok,
+          error: message.error,
+          componentName: message.componentName,
+          spec: message.spec
+        });
+        return;
+      }
+
+      if (message.type === "image_result") {
+        renderImage(message);
+        if (message.requestId === undefined || message.requestId === null) {
+          return;
+        }
+        send({
+          type: "image_result",
+          id: message.requestId,
+          ok: message.ok,
+          error: message.error,
+          componentName: message.componentName,
+          image: state.imageBase64,
+          mimeType: "image/jpeg"
+        });
+      }
+    };
+
+    setStatus("connecting", "Connecting…");
+    connect();
+  })();
+</script>

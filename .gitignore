@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output.
+# code.js is generated from code.ts by `npm run build` in plugin/. It is ignored
+# so generated code does not churn every diff — which means a fresh clone MUST
+# run `npm install && npm run build` in plugin/ before Figma can import the
+# plugin. If you would rather the manifest be importable straight from a clone,
+# delete the next line and commit code.js.
+plugin/code.js
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

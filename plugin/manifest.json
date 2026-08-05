@@ -1,0 +1,14 @@
+{
+  "name": "Designsicle",
+  "id": "designsicle",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma", "dev"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": ["ws://localhost:3055", "http://localhost:3055"],
+    "devAllowedDomains": ["*"],
+    "reasoning": "Connects to the local Designsicle MCP server so a coding agent can pull the current selection's design spec."
+  }
+}
