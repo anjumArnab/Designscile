@@ -632,11 +632,44 @@
       // in the sandbox. The server's id rides along as requestId and comes back
       // untouched, which is what keeps overlapping calls from crossing wires.
       if (message.type === "get_spec") {
-        parent.postMessage({ pluginMessage: { type: "extract", requestId: message.id } }, "*");
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "extract",
+              requestId: message.id,
+              link: typeof message.link === "string" ? message.link : null
+            }
+          },
+          "*"
+        );
         return;
       }
       if (message.type === "get_image") {
-        parent.postMessage({ pluginMessage: { type: "export_image", requestId: message.id } }, "*");
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "export_image",
+              requestId: message.id,
+              link: typeof message.link === "string" ? message.link : null
+            }
+          },
+          "*"
+        );
+        return;
+      }
+      if (message.type === "get_assets") {
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "export_assets",
+              requestId: message.id,
+              link: typeof message.link === "string" ? message.link : null,
+              nodeIds: Array.isArray(message.nodeIds) ? message.nodeIds : null,
+              format: typeof message.format === "string" ? message.format : null
+            }
+          },
+          "*"
+        );
       }
     }
 
@@ -688,6 +721,52 @@
           image: state.imageBase64,
           mimeType: "image/jpeg"
         });
+        return;
+      }
+
+      if (message.type === "assets_result") {
+        if (message.requestId === undefined || message.requestId === null) {
+          return;
+        }
+        // SVG bytes become text here — the iframe has TextDecoder, the sandbox
+        // does not — so SVG reaches the agent as file contents rather than
+        // base64 that would need decoding again. Rasters stay base64.
+        var assets = [];
+        if (message.ok && Array.isArray(message.assets)) {
+          for (var i = 0; i < message.assets.length; i++) {
+            var asset = message.assets[i];
+            var bytes = new Uint8Array(asset.bytes);
+            if (asset.format === "SVG") {
+              assets.push({
+                name: asset.name,
+                nodeId: asset.nodeId,
+                format: asset.format,
+                mimeType: asset.mimeType,
+                encoding: "utf8",
+                data: new TextDecoder().decode(bytes)
+              });
+            } else {
+              assets.push({
+                name: asset.name,
+                nodeId: asset.nodeId,
+                format: asset.format,
+                mimeType: asset.mimeType,
+                encoding: "base64",
+                data: toBase64(bytes)
+              });
+            }
+          }
+        }
+        send({
+          type: "assets_result",
+          id: message.requestId,
+          ok: message.ok,
+          error: message.error,
+          componentName: message.componentName,
+          assets: message.ok ? assets : null,
+          skipped: message.skipped || null
+        });
+        return;
       }
     };
 

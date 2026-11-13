@@ -6,13 +6,13 @@ Designsicle is a Figma plugin plus a local MCP server that gives any MCP-capable
 
 ```
 CONTAINER: Column, bg #FAFAF5, radius 24, border 2px solid #E6E6E6
-  IMAGE: 395×296 px
+  IMAGE: 395×296 px, id 1:23
   TEXT: "Heirloom tomato", Inter, 20px, weight 600, #000000, line-height 130%, at 24, gap 24
   TEXT: "$5.99 / lb", Inter, 20px, weight 600, #426B1F, line-height 130%, at 24, gap 4
   TEXT: "Grown in San Juan Capistrano, CA", Inter, 16px, weight 400, #6D6D6D, line-height 150%, at 24, gap 16
 ```
 
-One line per element, two-space indent for depth. Figma defaults are omitted — if a property isn't there, it doesn't change the generated code. Where a Figma **variable** is bound, the spec emits its name (`bg brand/primary`) instead of a raw hex, so output lands in your design system rather than as magic numbers.
+One line per element, two-space indent for depth. Figma defaults are omitted — if a property isn't there, it doesn't change the generated code. Where a Figma **variable** is bound, the spec emits its name (`bg brand/primary`) instead of a raw hex, so output lands in your design system rather than as magic numbers. ICON and IMAGE lines also end with the node's `id` — the handle `download_assets` uses to export that node's real bytes.
 
 ## Setup
 
@@ -44,6 +44,7 @@ You never start the server yourself — your agent launches it. The plugin dials
 
 1. Open the plugin in Figma and select a component. The panel shows a live render and spec.
 2. Tell your agent what you want, e.g. *"implement my current Figma selection"* or *"restyle the cart button to match my Figma selection"*.
+3. Or skip selecting: right-click a frame (or a page) in Figma → **Copy link**, and hand the URL to your agent.
 
 The agent decides the rest. It picks `mode` (`redesign` or `create`) from what you asked, and resolves `target_file` itself — the plugin deliberately cannot read your filesystem.
 
@@ -51,11 +52,27 @@ The agent decides the rest. It picks `mode` (`redesign` or `create`) from what y
 
 | Tool | Purpose |
 |---|---|
-| `get_selection_spec` | The spec plus mode-specific instructions. Optional `mode` and `target_file`. |
-| `get_component_image` | A JPEG render, for when layout is visually ambiguous. |
+| `get_selection_spec` | The spec plus mode-specific instructions. Optional `mode`, `target_file`, and `link`. |
+| `get_component_image` | A JPEG render, for when layout is visually ambiguous. Optional `link`. |
+| `download_assets` | Real asset bytes — icons as SVG, images as PNG — from the selection or a link, all of them or specific nodes by `id`. |
 | `check_figma_connection` | Whether the plugin is connected, so failures are diagnosable. |
 
 `get_selection_spec` returns instructions, not raw data. In redesign mode it tells the agent to preserve the file's existing public API; in create mode, to expose the design's data as constructor parameters. Both require that any placeholder it introduces be listed explicitly at the end of its response — structure and styling may be derived from the design, but **data and behaviour must be flagged as assumed**. A tool that silently fabricates is untrustworthy.
+
+## Links
+
+`get_selection_spec` and `get_component_image` accept an optional `link` — the URL from Figma's right-click **Copy link to selection**. With a link, nothing needs to be selected and the spec is built from the linked node instead. **Copy link to page** works too: the page's visible top-level frames each get a spec, headed by a `# FrameName` line so the agent can tell the sections apart.
+
+The link must point into the file currently open in the Figma desktop app. The plugin API has no REST access, so — unlike token-based Figma MCP servers — Designsicle cannot read a file you haven't opened; a foreign-file link comes back as an error asking you to open it first.
+
+## Assets
+
+`download_assets` exports the real bytes so the agent never has to substitute a guessed icon:
+
+- **No arguments** — every `ICON` and `IMAGE` in the current selection (or the linked node's tree): icons as SVG, images as PNG.
+- **`node_ids`** — specific nodes, taken from the `id` on any `ICON`/`IMAGE` spec line or from a link's `node-id`. Any node can be exported this way, in any `format` (`svg`, `png`, `jpg`).
+
+SVG comes back as file contents; PNG/JPEG as base64 the agent decodes. The server writes nothing to disk itself — saving into your project stays the agent's job, like every other file it touches.
 
 ## Limits
 
@@ -65,6 +82,8 @@ Read these before trusting the output.
 - **Plugins need edit access.** On files shared with you as view-only, use Dev Mode — which needs a Dev seat on a paid plan. Designsicle declares both editor types.
 - **Auto layout produces far better output than absolute positioning.** For absolutely-positioned frames, Designsicle infers `Column`/`Row` with per-child gaps where children queue along one axis, and derives padding from a symmetric inset. Anything else stays a `Stack` with raw coordinates — accurate, but the weakest output. It cannot recover intent auto layout would have stated outright, like "centered" versus "happens to sit at 32px".
 - **Image and icon detection is heuristic**, based on layer names and size. Tune the constants at the top of `plugin/code.ts`.
+- **Links are same-file only.** The plugin reads the file open in Figma; it cannot fetch another file by URL the way token-based REST integrations can. A page link specs every visible top-level frame, which for a busy page is a lot of text.
+- **Asset downloads are capped** at 64 assets / 6 MB per call; anything skipped is listed with its node id so it can be fetched explicitly.
 - **Font metrics differ** between Figma and rendered UI, so line-height spacing will not be pixel-identical.
 - **One plugin connection at a time**; the newest wins.
 - **JPEG has no transparency** — components with transparent backgrounds render filled.

@@ -35,6 +35,16 @@ const UI_HEIGHT = 720;
 const IMAGE_EXPORT_SCALE = 2;
 const IMAGE_MAX_DIMENSION = 2048;
 
+// Asset export (download_assets): icons ship as SVG, images as PNG. The caps
+// keep one call from producing a payload that stalls the relay; everything
+// skipped is reported with its node id so the agent can fetch it explicitly.
+const ASSET_EXPORT_SCALE = 2;
+const ASSET_MAX_DIMENSION = 2048;
+const MAX_ASSETS = 64;
+const MAX_REQUESTED_ASSETS = 32;
+const MAX_ASSET_BYTES = 2 * 1024 * 1024;
+const MAX_TOTAL_ASSET_BYTES = 6 * 1024 * 1024;
+
 const MAIN_AXIS_ALIGN: { [key: string]: string } = {
   MIN: "start",
   CENTER: "center",
@@ -805,6 +815,8 @@ async function imageLine(node: SceneNode, depth: number): Promise<string> {
   if (shadow !== null) {
     parts.push(shadow);
   }
+  // The id is the handle download_assets uses to export this node's bytes.
+  parts.push("id " + node.id);
   return line(depth, "IMAGE: " + parts.join(", "));
 }
 
@@ -817,6 +829,8 @@ async function iconLine(node: SceneNode, depth: number): Promise<string> {
   if (color !== null) {
     parts.push(color);
   }
+  // The id is the handle download_assets uses to export this node's bytes.
+  parts.push("id " + node.id);
   const label = node.name.trim() === "" ? "icon" : node.name.trim();
   return line(depth, "ICON: " + label + " — " + parts.join(", "));
 }
@@ -919,11 +933,28 @@ async function extractNode(
   return lines;
 }
 
-async function buildSpec(node: SceneNode): Promise<string> {
+async function buildSpecForRoot(root: BaseNode): Promise<string> {
   // Cleared per build so a renamed variable is reflected immediately.
   variableNameCache.clear();
-  const lines = await extractNode(node, 0, true, null, false);
-  return lines.join("\n");
+  // A page link means "the whole page": every visible top-level node gets its
+  // own spec, headed by its name so the agent can tell the sections apart.
+  // Header lines start with #, which no other spec line can start with.
+  if (root.type === "PAGE") {
+    const sections: string[] = [];
+    for (const child of root.children) {
+      if (!isVisible(child)) {
+        continue;
+      }
+      const lines = await extractNode(child, 0, true, null, false);
+      if (lines.length === 0) {
+        continue;
+      }
+      const name = child.name.trim() === "" ? "Unnamed frame" : child.name.trim();
+      sections.push("# " + name + "\n" + lines.join("\n"));
+    }
+    return sections.join("\n\n");
+  }
+  return (await extractNode(root as SceneNode, 0, true, null, false)).join("\n");
 }
 
 // Messaging
@@ -942,37 +973,182 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-// Never throws — the iframe always receives a payload it can render.
-async function currentSelectionSpec(): Promise<SpecPayload> {
-  const selection = figma.currentPage.selection;
-  if (selection.length === 0) {
+// Links
+//
+// "Copy link to selection" (or "Copy link to page") yields
+//   https://www.figma.com/design/<fileKey>/<name>?node-id=12-34&t=…
+// The URL writes dashes where the plugin API uses colons, and older links
+// percent-encode the colon instead. Only the file currently open in Figma can
+// be read — the plugin API has no REST access — so a foreign file becomes an
+// error the agent can act on.
+
+interface ParsedLink {
+  fileKey: string | null;
+  nodeId: string | null;
+}
+
+function normalizeNodeIdParam(raw: string): string | null {
+  let value = raw;
+  try {
+    value = decodeURIComponent(value);
+  } catch (_error) {
+    // Keep the raw value; a stray % just fails the format check below.
+  }
+  value = value.replace(/-/g, ":");
+  return /^\d+:\d+$/.test(value) ? value : null;
+}
+
+function parseFigmaLink(raw: string): ParsedLink | null {
+  const trimmed = raw.trim();
+  const fileMatch = /^https?:\/\/(?:www\.)?figma\.com\/(?:design|file|board)\/([^/?#]+)/i.exec(
+    trimmed
+  );
+  const nodeMatch = /[?&]node-id=([^&#]+)/i.exec(trimmed);
+  const pageMatch = /[?&]page-id=([^&#]+)/i.exec(trimmed);
+  if (fileMatch === null && nodeMatch === null && pageMatch === null) {
+    return null;
+  }
+  let nodeId: string | null = null;
+  if (nodeMatch !== null) {
+    nodeId = normalizeNodeIdParam(nodeMatch[1]);
+  }
+  if (nodeId === null && pageMatch !== null) {
+    nodeId = normalizeNodeIdParam(pageMatch[1]);
+  }
+  return { fileKey: fileMatch === null ? null : fileMatch[1], nodeId: nodeId };
+}
+
+type RootResolution = { ok: true; root: BaseNode } | { ok: false; error: string };
+
+// figma.fileKey exists only for private plugins; without it the file-key check
+// degrades to the not-found error below, which names the likely cause.
+function openFileKey(): string | null {
+  try {
+    const key = figma.fileKey;
+    return typeof key === "string" ? key : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+// dynamic-page document access hides other pages until they are loaded, and a
+// link may well point at one. Loading is attempted only after a miss, so the
+// common same-page link pays nothing.
+async function findNodeById(nodeId: string): Promise<BaseNode | null> {
+  try {
+    const direct = await figma.getNodeByIdAsync(nodeId);
+    if (direct !== null) {
+      return direct;
+    }
+    for (const page of figma.root.children) {
+      try {
+        await page.loadAsync();
+      } catch (_error) {
+        // The current page is already loaded and may reject a reload.
+      }
+      if (page.id === nodeId) {
+        return page;
+      }
+    }
+    return await figma.getNodeByIdAsync(nodeId);
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function resolveLinkRoot(link: string): Promise<RootResolution> {
+  const parsed = parseFigmaLink(link);
+  if (parsed === null) {
     return {
       ok: false,
-      error: "Nothing selected in Figma.",
-      componentName: null,
-      spec: null
+      error:
+        "Not a recognised Figma file URL. Expected the form " +
+        "https://www.figma.com/design/…?node-id=… as produced by 'Copy link to selection'."
     };
   }
-  const node = selection[0];
+  if (parsed.nodeId === null) {
+    return {
+      ok: false,
+      error:
+        "The link carries no node id. In Figma, right-click the node (or the page tab) and use " +
+        "'Copy link to selection' or 'Copy link to page'."
+    };
+  }
+  const openKey = openFileKey();
+  if (parsed.fileKey !== null && openKey !== null && parsed.fileKey !== openKey) {
+    return {
+      ok: false,
+      error:
+        "The link points at a different file than the one open in Figma. The plugin can only read " +
+        "the open file — ask the user to open the linked file in the Figma desktop app and try again."
+    };
+  }
+  const node = await findNodeById(parsed.nodeId);
+  if (node === null) {
+    return {
+      ok: false,
+      error:
+        "No node with id " +
+        parsed.nodeId +
+        " exists in the open file. It may have been deleted, it may sit on a page that could not " +
+        "be loaded, or the link may belong to a different file — ask the user to open that file " +
+        "in the Figma desktop app and try again."
+    };
+  }
+  if (node.type === "DOCUMENT") {
+    return { ok: false, error: "The link points at the document root, which has no spec." };
+  }
+  return { ok: true, root: node };
+}
+
+function selectionRoot(): RootResolution {
+  const selection = figma.currentPage.selection;
+  if (selection.length === 0) {
+    return { ok: false, error: "Nothing selected in Figma." };
+  }
+  return { ok: true, root: selection[0] };
+}
+
+async function requestRoot(link: string | null): Promise<RootResolution> {
+  if (link !== null && link.trim() !== "") {
+    return resolveLinkRoot(link);
+  }
+  return selectionRoot();
+}
+
+// Never throws — the iframe always receives a payload it can render.
+async function specPayloadFor(root: BaseNode): Promise<SpecPayload> {
   try {
-    const spec = await buildSpec(node);
+    const spec = await buildSpecForRoot(root);
     if (spec === "") {
+      const what = root.type === "PAGE" ? "page" : "selection";
       return {
         ok: false,
-        error: "Selection produced an empty spec. Select a frame, component, or text layer.",
-        componentName: node.name,
+        error:
+          "The " +
+          what +
+          " produced an empty spec. Select or link a frame, component, or text layer.",
+        componentName: root.name,
         spec: null
       };
     }
-    return { ok: true, error: null, componentName: node.name, spec: spec };
+    return { ok: true, error: null, componentName: root.name, spec: spec };
   } catch (error) {
     return {
       ok: false,
       error: "Extraction failed: " + errorMessage(error),
-      componentName: node.name,
+      componentName: root.name,
       spec: null
     };
   }
+}
+
+async function requestSpec(link: string | null): Promise<SpecPayload> {
+  const resolution = await requestRoot(link);
+  if (!resolution.ok) {
+    return { ok: false, error: resolution.error, componentName: null, spec: null };
+  }
+  return specPayloadFor(resolution.root);
 }
 
 interface ImagePayload {
@@ -983,13 +1159,22 @@ interface ImagePayload {
 }
 
 // Never throws — a failed export must not take the spec down with it.
-// Every SceneNode carries exportAsync, so no capability guard is needed here.
-async function currentSelectionImage(): Promise<ImagePayload> {
-  const selection = figma.currentPage.selection;
-  if (selection.length === 0) {
-    return { ok: false, error: "Nothing selected in Figma.", componentName: null, bytes: null };
+// Every SceneNode carries exportAsync; pages are the one shape that cannot be
+// rendered whole, and a link may point at one.
+async function requestImage(link: string | null): Promise<ImagePayload> {
+  const resolution = await requestRoot(link);
+  if (!resolution.ok) {
+    return { ok: false, error: resolution.error, componentName: null, bytes: null };
   }
-  const node = selection[0];
+  if (resolution.root.type === "PAGE") {
+    return {
+      ok: false,
+      error: "A page cannot be rendered as a single image. Link or select a specific frame.",
+      componentName: resolution.root.name,
+      bytes: null
+    };
+  }
+  const node = resolution.root as SceneNode;
   try {
     let scale = IMAGE_EXPORT_SCALE;
     if (hasSize(node)) {
@@ -1013,6 +1198,233 @@ async function currentSelectionImage(): Promise<ImagePayload> {
   }
 }
 
+// Asset export (download_assets)
+//
+// Icons ship as SVG — small, recolourable, usable directly as file contents.
+// Images ship as PNG because a raster fill has no vector source. Explicitly
+// requested nodes may force any format.
+
+type AssetFormat = "SVG" | "PNG" | "JPG";
+
+interface ExportedAsset {
+  name: string;
+  nodeId: string;
+  format: AssetFormat;
+  mimeType: string;
+  bytes: Uint8Array;
+}
+
+interface SkippedAsset {
+  nodeId: string;
+  reason: string;
+  name: string;
+}
+
+interface AssetsPayload {
+  ok: boolean;
+  error: string | null;
+  componentName: string | null;
+  assets: ExportedAsset[] | null;
+  skipped: SkippedAsset[] | null;
+}
+
+function mimeTypeFor(format: AssetFormat): string {
+  if (format === "SVG") {
+    return "image/svg+xml";
+  }
+  return format === "PNG" ? "image/png" : "image/jpeg";
+}
+
+function assetFileExtension(format: AssetFormat): string {
+  return format === "SVG" ? "svg" : format === "PNG" ? "png" : "jpg";
+}
+
+function assetFileName(name: string): string {
+  const cleaned = name.replace(/[^a-z0-9\-_ ]/gi, "").trim();
+  return (cleaned === "" ? "asset" : cleaned).replace(/\s+/g, "-").toLowerCase();
+}
+
+// Mirrors the spec's classification, so what download_assets returns matches
+// what the spec called an ICON or an IMAGE. Text is excluded first, exactly as
+// in extractNode — a layer named "photo caption" is text, not an asset.
+function inferredAssetFormat(node: SceneNode): AssetFormat {
+  if (node.type !== "TEXT" && isImageElement(node)) {
+    return "PNG";
+  }
+  return "SVG";
+}
+
+function collectAssetNodes(root: BaseNode): SceneNode[] {
+  const found: SceneNode[] = [];
+  const visit = (node: SceneNode): void => {
+    if (!isVisible(node)) {
+      return;
+    }
+    if (node.type === "TEXT") {
+      return;
+    }
+    if (isImageElement(node) || isIconElement(node)) {
+      found.push(node);
+      return;
+    }
+    for (const child of visibleChildren(node)) {
+      visit(child);
+    }
+  };
+  if (root.type === "PAGE") {
+    for (const child of root.children) {
+      visit(child);
+    }
+    return found;
+  }
+  visit(root as SceneNode);
+  return found;
+}
+
+async function exportAssetBytes(node: SceneNode, format: AssetFormat): Promise<Uint8Array> {
+  if (format === "SVG") {
+    // Outlined text keeps the asset rendering correctly on machines without
+    // the design's fonts.
+    return node.exportAsync({ format: "SVG" });
+  }
+  let scale = ASSET_EXPORT_SCALE;
+  if (hasSize(node)) {
+    const longest = Math.max(node.width, node.height);
+    if (longest > 0 && longest * scale > ASSET_MAX_DIMENSION) {
+      scale = Math.max(1, ASSET_MAX_DIMENSION / longest);
+    }
+  }
+  return node.exportAsync({ format: format, constraint: { type: "SCALE", value: scale } });
+}
+
+// Never throws — per-node failures become skipped entries the agent can act on.
+async function requestAssets(
+  link: string | null,
+  requestedIds: readonly string[] | null,
+  forcedFormat: AssetFormat | null
+): Promise<AssetsPayload> {
+  // The root scopes the automatic sweep and names the payload. Explicit node
+  // ids are self-sufficient — a selection that vanished mid-flight must not
+  // block a by-id export.
+  let root: BaseNode | null = null;
+  const resolution = await requestRoot(link);
+  if (resolution.ok) {
+    root = resolution.root;
+  } else if (requestedIds === null || requestedIds.length === 0) {
+    return { ok: false, error: resolution.error, componentName: null, assets: null, skipped: null };
+  }
+
+  const skipped: SkippedAsset[] = [];
+  const targets: { node: SceneNode; format: AssetFormat }[] = [];
+
+  if (requestedIds !== null && requestedIds.length > 0) {
+    const ids = requestedIds.slice(0, MAX_REQUESTED_ASSETS);
+    for (let i = MAX_REQUESTED_ASSETS; i < requestedIds.length; i++) {
+      skipped.push({
+        nodeId: requestedIds[i],
+        name: "",
+        reason: "per-call limit of " + MAX_REQUESTED_ASSETS + " node ids reached"
+      });
+    }
+    for (const id of ids) {
+      const nodeId = normalizeNodeIdParam(id);
+      if (nodeId === null) {
+        skipped.push({ nodeId: id, name: "", reason: "not a valid node id" });
+        continue;
+      }
+      const node = await findNodeById(nodeId);
+      if (node === null || node.type === "PAGE" || node.type === "DOCUMENT") {
+        skipped.push({ nodeId: nodeId, name: "", reason: "not found in the open file" });
+        continue;
+      }
+      const sceneNode = node as SceneNode;
+      targets.push({
+        node: sceneNode,
+        format: forcedFormat === null ? inferredAssetFormat(sceneNode) : forcedFormat
+      });
+    }
+  } else if (root !== null) {
+    for (const node of collectAssetNodes(root)) {
+      targets.push({
+        node: node,
+        format: forcedFormat === null ? inferredAssetFormat(node) : forcedFormat
+      });
+    }
+  }
+
+  const usedNames = new Set<string>();
+  const assets: ExportedAsset[] = [];
+  let totalBytes = 0;
+  let sizeCapped = false;
+
+  for (const target of targets) {
+    const label = target.node.name.trim() === "" ? "asset" : target.node.name.trim();
+    if (assets.length >= MAX_ASSETS) {
+      skipped.push({
+        nodeId: target.node.id,
+        name: label,
+        reason: "asset count limit of " + MAX_ASSETS + " reached"
+      });
+      continue;
+    }
+    if (sizeCapped) {
+      skipped.push({ nodeId: target.node.id, name: label, reason: "total size limit reached" });
+      continue;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = await exportAssetBytes(target.node, target.format);
+    } catch (error) {
+      skipped.push({
+        nodeId: target.node.id,
+        name: label,
+        reason: "export failed: " + errorMessage(error)
+      });
+      continue;
+    }
+    if (bytes.length > MAX_ASSET_BYTES) {
+      skipped.push({
+        nodeId: target.node.id,
+        name: label,
+        reason: "larger than " + MAX_ASSET_BYTES / 1024 + " KB"
+      });
+      continue;
+    }
+    if (totalBytes + bytes.length > MAX_TOTAL_ASSET_BYTES) {
+      sizeCapped = true;
+      skipped.push({ nodeId: target.node.id, name: label, reason: "total size limit reached" });
+      continue;
+    }
+    totalBytes += bytes.length;
+
+    const base = assetFileName(target.node.name);
+    const extension = assetFileExtension(target.format);
+    let name = base + "." + extension;
+    let n = 2;
+    while (usedNames.has(name)) {
+      name = base + "-" + n + "." + extension;
+      n += 1;
+    }
+    usedNames.add(name);
+
+    assets.push({
+      name: name,
+      nodeId: target.node.id,
+      format: target.format,
+      mimeType: mimeTypeFor(target.format),
+      bytes: bytes
+    });
+  }
+
+  return {
+    ok: true,
+    error: null,
+    componentName: root === null ? null : root.name,
+    assets: assets,
+    skipped: skipped.length === 0 ? null : skipped
+  };
+}
+
 // Selection changes fire rapidly during a drag-select; only the newest preview
 // is worth posting.
 let previewSequence = 0;
@@ -1022,7 +1434,7 @@ async function sendPreview(): Promise<void> {
   const sequence = previewSequence;
 
   // Spec first — it is fast, and the panel should not wait on a render.
-  const payload = await currentSelectionSpec();
+  const payload = await requestSpec(null);
   if (sequence !== previewSequence) {
     return;
   }
@@ -1034,7 +1446,7 @@ async function sendPreview(): Promise<void> {
     spec: payload.spec
   });
 
-  const image = await currentSelectionImage();
+  const image = await requestImage(null);
   if (sequence !== previewSequence) {
     return;
   }
@@ -1051,6 +1463,10 @@ function isRecord(value: unknown): value is { [key: string]: unknown } {
   return typeof value === "object" && value !== null;
 }
 
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
 figma.showUI(__html__, { width: UI_WIDTH, height: UI_HEIGHT, themeColors: true });
 
 figma.ui.onmessage = async (message: unknown): Promise<void> => {
@@ -1058,7 +1474,7 @@ figma.ui.onmessage = async (message: unknown): Promise<void> => {
     return;
   }
   if (message.type === "extract") {
-    const payload = await currentSelectionSpec();
+    const payload = await requestSpec(stringOrNull(message.link));
     figma.ui.postMessage({
       type: "spec_result",
       requestId: message.requestId,
@@ -1070,7 +1486,7 @@ figma.ui.onmessage = async (message: unknown): Promise<void> => {
     return;
   }
   if (message.type === "export_image") {
-    const image = await currentSelectionImage();
+    const image = await requestImage(stringOrNull(message.link));
     figma.ui.postMessage({
       type: "image_result",
       requestId: message.requestId,
@@ -1078,6 +1494,25 @@ figma.ui.onmessage = async (message: unknown): Promise<void> => {
       error: image.error,
       componentName: image.componentName,
       bytes: image.bytes
+    });
+    return;
+  }
+  if (message.type === "export_assets") {
+    const nodeIds = Array.isArray(message.nodeIds)
+      ? message.nodeIds.filter((id): id is string => typeof id === "string")
+      : null;
+    const rawFormat = typeof message.format === "string" ? message.format : "";
+    const forcedFormat: AssetFormat | null =
+      rawFormat === "SVG" || rawFormat === "PNG" || rawFormat === "JPG" ? rawFormat : null;
+    const payload = await requestAssets(stringOrNull(message.link), nodeIds, forcedFormat);
+    figma.ui.postMessage({
+      type: "assets_result",
+      requestId: message.requestId,
+      ok: payload.ok,
+      error: payload.error,
+      componentName: payload.componentName,
+      assets: payload.assets,
+      skipped: payload.skipped
     });
     return;
   }

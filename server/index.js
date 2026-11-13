@@ -18,6 +18,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 // port conflicts and for testing against a live instance.
 const PORT = Number(process.env.DESIGNSICLE_PORT) || 3055;
 const REQUEST_TIMEOUT_MS = 10000;
+// Whole-tree walks (asset sweeps, page specs) take longer than a single
+// selection read; they get the roomier timeout.
+const LONG_REQUEST_TIMEOUT_MS = 30000;
 const BIND_RETRY_MS = 2000;
 
 // stdout carries the JSON-RPC framing for the stdio transport. Anything written
@@ -80,9 +83,11 @@ function notConnectedMessage() {
   );
 }
 
-// `kind` is "get_spec" or "get_image" — the correlation machinery is identical
-// for both, so it lives in one place.
-function requestFromPlugin(kind) {
+// `kind` is "get_spec", "get_image", or "get_assets". `extra` carries the
+// optional parameters (link, nodeIds, format); the correlation machinery is
+// identical for all three, so it lives in one place.
+function requestFromPlugin(kind, extra) {
+  const fields = extra === undefined ? {} : extra;
   return new Promise((resolve, reject) => {
     if (!isPluginConnected()) {
       // Reject immediately with something the agent can act on. Never hang.
@@ -92,22 +97,24 @@ function requestFromPlugin(kind) {
 
     const id = nextRequestId++;
     const socket = pluginSocket;
+    const timeoutMs =
+      kind === "get_assets" || fields.link ? LONG_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
 
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(
         new Error(
-          `The Designsicle plugin did not respond within ${REQUEST_TIMEOUT_MS / 1000}s. ` +
+          `The Designsicle plugin did not respond within ${timeoutMs / 1000}s. ` +
             "It may have been closed mid-request. Ask the user to confirm the plugin is open " +
             "and showing 'connected'."
         )
       );
-    }, REQUEST_TIMEOUT_MS);
+    }, timeoutMs);
 
     pending.set(id, { resolve, reject, timer, socket });
 
     try {
-      socket.send(JSON.stringify({ type: kind, id }));
+      socket.send(JSON.stringify(Object.assign({ type: kind, id: id }, fields)));
     } catch (error) {
       clearTimeout(timer);
       pending.delete(id);
@@ -212,7 +219,7 @@ function handlePluginMessage(message) {
     return;
   }
 
-  if (message.type === "spec_result" || message.type === "image_result") {
+  if (message.type === "spec_result" || message.type === "image_result" || message.type === "assets_result") {
     const entry = pending.get(message.id);
     if (entry === undefined) {
       // Timed out, or a reply from a socket we already gave up on.
@@ -233,15 +240,16 @@ function handlePluginMessage(message) {
 // The server never returns the bare spec. It returns spec plus instructions,
 // because the developer's stated intent is what turns data into behaviour.
 
-function assembleRedesignPrompt(result, targetFile) {
+function assembleRedesignPrompt(result, targetFile, link) {
   const target =
     typeof targetFile === "string" && targetFile.trim() !== ""
       ? targetFile.trim()
       : "not specified — ask the user which file to update before changing anything.";
+  const source = typeof link === "string" && link.trim() !== "" ? `FIGMA LINK: ${link.trim()}\n` : "";
 
   return `MODE: REDESIGN
 TARGET FILE: ${target}
-FIGMA COMPONENT: ${result.componentName}
+${source}FIGMA NODE: ${result.componentName}
 
 UPDATED DESIGN SPEC:
 ${result.spec}
@@ -259,9 +267,11 @@ INSTRUCTIONS:
    navigation, or data-fetching that is not already present in the file.`;
 }
 
-function assembleCreatePrompt(result) {
+function assembleCreatePrompt(result, link) {
+  const source = typeof link === "string" && link.trim() !== "" ? `FIGMA LINK: ${link.trim()}\n` : "";
+
   return `MODE: CREATE NEW COMPONENT
-FIGMA COMPONENT: ${result.componentName}
+${source}FIGMA NODE: ${result.componentName}
 
 DESIGN SPEC:
 ${result.spec}
@@ -324,17 +334,22 @@ server.registerTool(
   {
     title: "Get Figma selection spec",
     description:
-      "Fetches the design spec for the user's CURRENT Figma selection and returns ready-to-follow " +
-      "implementation instructions. Call this whenever the user refers to their Figma selection, " +
-      "their current design, 'this component', or asks you to implement, build, or redesign " +
-      "something from Figma.\n\n" +
+      "Fetches the design spec for the user's CURRENT Figma selection — or for any node they " +
+      "linked — and returns ready-to-follow implementation instructions. Call this whenever the " +
+      "user refers to their Figma selection, their current design, 'this component', or asks you " +
+      "to implement, build, or redesign something from Figma.\n\n" +
+      "If the user's message contains a Figma URL (from right-click 'Copy link to selection', or " +
+      "'Copy link to page' to spec an entire page), pass it as link. The spec is then built from " +
+      "that node instead of the selection, and nothing needs to be selected. The link must point " +
+      "into the file currently open in the Figma desktop app.\n\n" +
       "YOU choose the mode from what the user asked for. If they want an existing file restyled " +
       "to match the design, pass mode='redesign' and set target_file to the path you resolved — " +
       "the plugin cannot read the filesystem, so resolving it is your job. If they want something " +
       "new built, pass mode='create'. The returned instructions differ by mode; follow them as " +
       "written.\n\n" +
-      "The spec is text and carries exact numbers. If the component's layout is visually complex " +
-      "and you want to see it, call get_component_image.",
+      "The spec is text and carries exact numbers. ICON and IMAGE lines end with a node id that " +
+      "download_assets accepts. If the component's layout is visually complex and you want to see " +
+      "it, call get_component_image (it accepts link too).",
     inputSchema: {
       mode: z
         .enum(["redesign", "create"])
@@ -349,16 +364,26 @@ server.registerTool(
         .describe(
           "Redesign mode only: the repo-relative path of the file to update, e.g. " +
             "'lib/home/widgets/cart_button.dart'. Resolve this yourself from the user's request."
+        ),
+      link: z
+        .string()
+        .optional()
+        .describe(
+          "A Figma URL from 'Copy link to selection' or 'Copy link to page'. When provided, the " +
+            "spec is built from that node instead of the current selection. Must point into the " +
+            "file currently open in the Figma desktop app."
         )
     },
     annotations: { readOnlyHint: true, openWorldHint: false }
   },
   async (args) => {
     const mode = args && args.mode === "create" ? "create" : "redesign";
+    const link =
+      args && typeof args.link === "string" && args.link.trim() !== "" ? args.link.trim() : undefined;
 
     let result;
     try {
-      result = await requestFromPlugin("get_spec");
+      result = await requestFromPlugin("get_spec", { link: link });
     } catch (error) {
       return { content: [{ type: "text", text: error.message }], isError: true };
     }
@@ -368,8 +393,8 @@ server.registerTool(
 
     const prompt =
       mode === "create"
-        ? assembleCreatePrompt(result)
-        : assembleRedesignPrompt(result, args && args.target_file);
+        ? assembleCreatePrompt(result, link)
+        : assembleRedesignPrompt(result, args && args.target_file, link);
 
     log(`returned ${mode} prompt for "${result.componentName}"`);
     return { content: [{ type: "text", text: prompt }] };
@@ -381,17 +406,30 @@ server.registerTool(
   {
     title: "Get Figma selection image",
     description:
-      "Returns a JPEG render of the user's CURRENT Figma selection. Use it alongside " +
-      "get_selection_spec when the component's structure is visually complex — overlapping " +
-      "elements, absolute positioning, or anything where seeing the arrangement resolves " +
-      "ambiguity the numbers alone leave open. The spec remains the source of truth for exact " +
-      "values; the image is for understanding intent and layout.",
+      "Returns a JPEG render of the user's CURRENT Figma selection, or of a linked node when " +
+      "link is passed. Use it alongside get_selection_spec when the component's structure is " +
+      "visually complex — overlapping elements, absolute positioning, or anything where seeing " +
+      "the arrangement resolves ambiguity the numbers alone leave open. The spec remains the " +
+      "source of truth for exact values; the image is for understanding intent and layout. " +
+      "A page link cannot be rendered as one image — link a specific frame.",
+    inputSchema: {
+      link: z
+        .string()
+        .optional()
+        .describe(
+          "A Figma URL from 'Copy link to selection'. Renders that node instead of the current " +
+            "selection. Must point into the file currently open in the Figma desktop app."
+        )
+    },
     annotations: { readOnlyHint: true, openWorldHint: false }
   },
-  async () => {
+  async (args) => {
+    const link =
+      args && typeof args.link === "string" && args.link.trim() !== "" ? args.link.trim() : undefined;
+
     let result;
     try {
-      result = await requestFromPlugin("get_image");
+      result = await requestFromPlugin("get_image", { link: link });
     } catch (error) {
       return { content: [{ type: "text", text: error.message }], isError: true };
     }
@@ -413,6 +451,136 @@ server.registerTool(
         }
       ]
     };
+  }
+);
+
+// Asset assembly — the one place the agent-ready asset response is built.
+// SVG arrives as file contents; rasters arrive as base64 with decode
+// instructions. The server writes nothing to disk itself — saving into the
+// user's project stays the agent's job, like every other file it touches.
+function assembleAssetsContent(result) {
+  const assets = Array.isArray(result.assets) ? result.assets : [];
+  const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+
+  if (assets.length === 0 && skipped.length === 0) {
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            "No icons or images were found in the target. If it does contain assets under " +
+            "unrecognised names, pass their node ids explicitly (node_ids) — the `id` values " +
+            "shown on ICON and IMAGE spec lines."
+        }
+      ]
+    };
+  }
+
+  const blocks = [];
+  const header = [`FIGMA ASSETS from "${result.componentName}" — ${assets.length} asset(s)`];
+  if (skipped.length > 0) {
+    header.push(`${skipped.length} node(s) skipped, listed at the end.`);
+  }
+  blocks.push({ type: "text", text: header.join("\n") });
+
+  for (const asset of assets) {
+    const label =
+      asset.encoding === "utf8"
+        ? `--- BEGIN ${asset.name} (node ${asset.nodeId}, ${asset.mimeType}) ---`
+        : `--- BEGIN ${asset.name} (node ${asset.nodeId}, ${asset.mimeType}, base64-encoded) ---`;
+    blocks.push({ type: "text", text: `${label}\n${asset.data}\n--- END ${asset.name} ---` });
+  }
+
+  const instructions = [
+    "INSTRUCTIONS:",
+    "1. Save each asset under its given file name in the project's asset directory — follow " +
+      "the codebase's existing conventions for asset location and naming.",
+    "2. SVG blocks are the exact file contents. Write them verbatim; do not reformat.",
+    "3. base64 blocks are binary. Decode before saving — e.g. Node: " +
+      'fs.writeFileSync(path, Buffer.from(block, "base64")), or PowerShell: ' +
+      "[IO.File]::WriteAllBytes(path, [Convert]::FromBase64String(block)).",
+    "4. Reference the saved files from the code you write rather than re-embedding them."
+  ];
+  if (skipped.length > 0) {
+    instructions.push("", "SKIPPED NODES:");
+    for (const entry of skipped) {
+      const label = entry.name === "" || entry.name === undefined ? entry.nodeId : `${entry.nodeId} (${entry.name})`;
+      instructions.push(`- ${label}: ${entry.reason}`);
+    }
+  }
+  blocks.push({ type: "text", text: instructions.join("\n") });
+
+  log(`returned ${assets.length} asset(s) for "${result.componentName}"`);
+  return { content: blocks };
+}
+
+server.registerTool(
+  "download_assets",
+  {
+    title: "Download Figma assets",
+    description:
+      "Downloads real asset bytes from the user's CURRENT Figma selection or from a linked " +
+      "node, so icons and images never have to be guessed or substituted: icons are exported " +
+      "as SVG, images as PNG.\n\n" +
+      "With no node_ids, every icon and image in the target tree is downloaded — the usual way " +
+      "to collect a component's assets in one call. Pass node_ids to fetch specific nodes " +
+      "instead: the `id` values shown at the end of ICON and IMAGE spec lines, or ids taken " +
+      "from Figma links (node-id in the URL). Combined with format, any node can be exported " +
+      "as svg, png, or jpg.\n\n" +
+      "Returned SVG blocks are the exact file contents; PNG/JPEG blocks are base64 that must " +
+      "be decoded before saving. Anything skipped is listed with its node id.",
+    inputSchema: {
+      node_ids: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Specific node ids to export, e.g. ['12:34']. Taken from a spec's `id` fields or a " +
+            "Figma link's node-id. Without them, every icon and image in the target tree is " +
+            "exported."
+        ),
+      link: z
+        .string()
+        .optional()
+        .describe(
+          "A Figma URL from 'Copy link to selection'. Scopes the no-node_ids export to that " +
+            "node's tree instead of the current selection. Must point into the file currently " +
+            "open in the Figma desktop app."
+        ),
+      format: z
+        .enum(["svg", "png", "jpg"])
+        .optional()
+        .describe(
+          "Forces the export format for all requested nodes. Default: inferred per node — svg " +
+            "for icons, png for images."
+        )
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false }
+  },
+  async (args) => {
+    const fields = {};
+    if (args && typeof args.link === "string" && args.link.trim() !== "") {
+      fields.link = args.link.trim();
+    }
+    if (args && Array.isArray(args.node_ids)) {
+      const ids = args.node_ids.filter((id) => typeof id === "string" && id.trim() !== "");
+      if (ids.length > 0) {
+        fields.nodeIds = ids;
+      }
+    }
+    if (args && typeof args.format === "string") {
+      fields.format = args.format.toUpperCase();
+    }
+
+    let result;
+    try {
+      result = await requestFromPlugin("get_assets", fields);
+    } catch (error) {
+      return { content: [{ type: "text", text: error.message }], isError: true };
+    }
+    if (result.ok !== true) {
+      return selectionFailure(result);
+    }
+    return assembleAssetsContent(result);
   }
 );
 
